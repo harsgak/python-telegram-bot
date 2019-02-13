@@ -1,18 +1,22 @@
--   repo: git://github.com/pre-commit/mirrors-yapf
-    sha: v0.11.0
+-   repo: git://github.com/python-telegram-bot/mirrors-yapf
+    sha: master
     hooks:
     -   id: yapf
         files: ^(telegram|tests)/.*\.py$
+        args:
+        - --diff
 -   repo: git://github.com/pre-commit/pre-commit-hooks
-    sha: 18d7035de5388cc7775be57f529c154bf541aab9
+    sha: v2.0.0
     hooks:
     -   id: flake8
-        files: ^telegram/.*\.py$
+        exclude: ^(setup.py|docs/source/conf.py)$
+        args:
+        - --ignore=W605,W503
 -   repo: git://github.com/pre-commit/mirrors-pylint
-    sha: v1.5.5
+    sha: v2.2.2
     hooks:
     -   id: pylint
         files: ^telegram/.*\.py$
         args:
         - --errors-only
-        - --disable=no-name-in-module,import-error
+        - --disable=import-error

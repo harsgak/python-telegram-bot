@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 #
 # A library that provides a Python interface to the Telegram Bot API
-# Copyright (C) 2015-2016
+# Copyright (C) 2015-2018
 # Leandro Toledo de Souza <devs@python-telegram-bot.org>
 #
 # This program is free software: you can redistribute it and/or modify
@@ -16,14 +16,14 @@
 #
 # You should have received a copy of the GNU Lesser Public License
 # along with this program.  If not, see [http://www.gnu.org/licenses/].
-"""This module contains a object that represents a Telegram Error."""
+"""This module contains an object that represents Telegram errors."""
 
 
 def _lstrip_str(in_s, lstr):
     """
     Args:
-        in_s (str): in string
-        lstr (str): substr to strip from left side
+        in_s (:obj:`str`): in string
+        lstr (:obj:`str`): substr to strip from left side
 
     Returns:
         str:
@@ -37,16 +37,7 @@ def _lstrip_str(in_s, lstr):
 
 
 class TelegramError(Exception):
-    """This object represents a Telegram Error."""
-
     def __init__(self, message):
-        """
-        Args:
-            message (str):
-
-        Returns:
-
-        """
         super(TelegramError, self).__init__()
 
         msg = _lstrip_str(message, 'Error: ')
@@ -62,13 +53,10 @@ class TelegramError(Exception):
 
 
 class Unauthorized(TelegramError):
-
-    def __init__(self):
-        super(Unauthorized, self).__init__('Unauthorized')
+    pass
 
 
 class InvalidToken(TelegramError):
-
     def __init__(self):
         super(InvalidToken, self).__init__('Invalid token')
 
@@ -82,20 +70,44 @@ class BadRequest(NetworkError):
 
 
 class TimedOut(NetworkError):
-
     def __init__(self):
         super(TimedOut, self).__init__('Timed out')
 
 
 class ChatMigrated(TelegramError):
+    """
+    Args:
+        new_chat_id (:obj:`int`):
+
+    """
 
     def __init__(self, new_chat_id):
-        """
-        Args:
-            new_chat_id (int):
-
-        Returns:
-
-        """
-        super(ChatMigrated, self).__init__('Chat migrated')
+        super(ChatMigrated,
+              self).__init__('Group migrated to supergroup. New chat id: {}'.format(new_chat_id))
         self.new_chat_id = new_chat_id
+
+
+class RetryAfter(TelegramError):
+    """
+    Args:
+        retry_after (:obj:`int`):
+
+    """
+
+    def __init__(self, retry_after):
+        super(RetryAfter,
+              self).__init__('Flood control exceeded. Retry in {} seconds'.format(retry_after))
+        self.retry_after = float(retry_after)
+
+
+class Conflict(TelegramError):
+    """
+        Raised when a long poll or webhook conflicts with another one.
+
+        Args:
+            msg (:obj:`str`): The message from telegrams server.
+
+    """
+
+    def __init__(self, msg):
+        super(Conflict, self).__init__(msg)

@@ -1,40 +1,30 @@
 #!/usr/bin/env python
-# encoding: utf-8
 #
 # A library that provides a Python interface to the Telegram Bot API
-# Copyright (C) 2015-2016
+# Copyright (C) 2015-2018
 # Leandro Toledo de Souza <devs@python-telegram-bot.org>
 #
 # This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
+# it under the terms of the GNU Lesser Public License as published by
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
+# GNU Lesser Public License for more details.
 #
-# You should have received a copy of the GNU General Public License
+# You should have received a copy of the GNU Lesser Public License
 # along with this program.  If not, see [http://www.gnu.org/licenses/].
-"""
-This module contains a object that represents Tests for Updater, Dispatcher,
-WebhookServer and WebhookHandler
-"""
 import logging
+import os
 import signal
 import sys
-import os
-import re
-import unittest
-from datetime import datetime
-from time import sleep
+from functools import partial
 from queue import Queue
 from random import randrange
-
-from future.builtins import bytes
-
-from telegram.utils.request import Request as Requester
+from threading import Thread, Event
+from time import sleep
 
 try:
     # python2
@@ -44,654 +34,258 @@ except ImportError:
     from urllib.request import Request, urlopen
     from urllib.error import HTTPError
 
-sys.path.append('.')
+import pytest
+from future.builtins import bytes
 
-from telegram import Update, Message, TelegramError, User, Chat, Bot, InlineQuery, CallbackQuery
-from telegram.ext import *
-from telegram.ext.dispatcher import run_async
-from telegram.error import Unauthorized, InvalidToken
-from tests.base import BaseTest
-from threading import Lock, Thread, current_thread, Semaphore
+from telegram import TelegramError, Message, User, Chat, Update, Bot
+from telegram.error import Unauthorized, InvalidToken, TimedOut, RetryAfter
+from telegram.ext import Updater
 
-# Enable logging
-root = logging.getLogger()
-root.setLevel(logging.INFO)
-
-ch = logging.StreamHandler(sys.stdout)
-ch.setLevel(logging.WARN)
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s ' '- %(message)s')
-ch.setFormatter(formatter)
-root.addHandler(ch)
+signalskip = pytest.mark.skipif(sys.platform == 'win32',
+                                reason='Can\'t send signals without stopping '
+                                       'whole process on windows')
 
 
-class UpdaterTest(BaseTest, unittest.TestCase):
-    """
-    This object represents Tests for Updater, Dispatcher, WebhookServer and
-    WebhookHandler
-    """
+class TestUpdater(object):
+    message_count = 0
+    received = None
+    attempts = 0
+    err_handler_called = Event()
+    cb_handler_called = Event()
 
-    _updater = None
-    received_message = None
-
-    def setUp(self):
-        self.updater = None
-        self.received_message = None
-        self.message_count = 0
-        self.lock = Lock()
-
-    @property
-    def updater(self):
-        return self._updater
-
-    @updater.setter
-    def updater(self, val):
-        if self._updater:
-            self._updater.stop()
-            self._updater.dispatcher._reset_singleton()
-            del self._updater.dispatcher
-
-        self._updater = val
-
-    def _setup_updater(self, *args, **kwargs):
-        bot = MockBot(*args, **kwargs)
-        self.updater = Updater(workers=2, bot=bot)
-
-    def tearDown(self):
-        self.updater = None
-
+    @pytest.fixture(autouse=True)
     def reset(self):
         self.message_count = 0
-        self.received_message = None
+        self.received = None
+        self.attempts = 0
+        self.err_handler_called.clear()
+        self.cb_handler_called.clear()
 
-    def telegramHandlerTest(self, bot, update):
-        self.received_message = update.message.text
-        self.message_count += 1
+    def error_handler(self, bot, update, error):
+        self.received = error.message
+        self.err_handler_called.set()
 
-    def telegramHandlerEditedTest(self, bot, update):
-        self.received_message = update.edited_message.text
-        self.message_count += 1
+    def callback(self, bot, update):
+        self.received = update.message.text
+        self.cb_handler_called.set()
 
-    def telegramInlineHandlerTest(self, bot, update):
-        self.received_message = (update.inline_query, update.chosen_inline_result)
-        self.message_count += 1
+    # TODO: test clean= argument of Updater._bootstrap
 
-    def telegramCallbackHandlerTest(self, bot, update):
-        self.received_message = update.callback_query
-        self.message_count += 1
+    @pytest.mark.parametrize(('error',),
+                             argvalues=[(TelegramError('Test Error 2'),),
+                                        (Unauthorized('Test Unauthorized'),)],
+                             ids=('TelegramError', 'Unauthorized'))
+    def test_get_updates_normal_err(self, monkeypatch, updater, error):
+        def test(*args, **kwargs):
+            raise error
 
-    @run_async
-    def asyncHandlerTest(self, bot, update):
+        monkeypatch.setattr('telegram.Bot.get_updates', test)
+        monkeypatch.setattr('telegram.Bot.set_webhook', lambda *args, **kwargs: True)
+        updater.dispatcher.add_error_handler(self.error_handler)
+        updater.start_polling(0.01)
+
+        # Make sure that the error handler was called
+        self.err_handler_called.wait()
+        assert self.received == error.message
+
+        # Make sure that Updater polling thread keeps running
+        self.err_handler_called.clear()
+        self.err_handler_called.wait()
+
+    def test_get_updates_bailout_err(self, monkeypatch, updater, caplog):
+        error = InvalidToken()
+
+        def test(*args, **kwargs):
+            raise error
+
+        with caplog.at_level(logging.DEBUG):
+            monkeypatch.setattr('telegram.Bot.get_updates', test)
+            monkeypatch.setattr('telegram.Bot.set_webhook', lambda *args, **kwargs: True)
+            updater.dispatcher.add_error_handler(self.error_handler)
+            updater.start_polling(0.01)
+            assert self.err_handler_called.wait(1) is not True
+
         sleep(1)
-        with self.lock:
-            self.received_message = update.message.text
-            self.message_count += 1
-
-    def stringHandlerTest(self, bot, update):
-        self.received_message = update
-        self.message_count += 1
-
-    def regexGroupHandlerTest(self, bot, update, groups, groupdict):
-        self.received_message = (groups, groupdict)
-        self.message_count += 1
-
-    def additionalArgsTest(self, bot, update, update_queue, job_queue, args):
-        job_queue.put(Job(lambda bot, job: job.schedule_removal(), 0.1))
-
-        self.received_message = update
-        self.message_count += 1
-
-        if args[0] == 'resend':
-            update_queue.put('/test5 noresend')
-        elif args[0] == 'noresend':
-            pass
-
-    @run_async
-    def asyncAdditionalHandlerTest(self, bot, update, update_queue=None):
-        sleep(1)
-        with self.lock:
-            if update_queue is not None:
-                self.received_message = update.message.text
-                self.message_count += 1
-
-    def errorRaisingHandlerTest(self, bot, update):
-        raise TelegramError(update)
-
-    def errorHandlerTest(self, bot, update, error):
-        self.received_message = error.message
-        self.message_count += 1
-
-    def test_addRemoveTelegramMessageHandler(self):
-        self._setup_updater('Test')
-        d = self.updater.dispatcher
-        from telegram.ext import Filters
-        handler = MessageHandler([Filters.text], self.telegramHandlerTest)
-        d.add_handler(handler)
-        self.updater.start_polling(0.01)
-        sleep(.1)
-        self.assertEqual(self.received_message, 'Test')
-
-        # Remove handler
-        d.remove_handler(handler)
-        self.reset()
-
-        self.updater.bot.send_messages = 1
-        sleep(.1)
-        self.assertTrue(None is self.received_message)
-
-    def test_editedMessageHandler(self):
-        self._setup_updater('Test', edited=True)
-        d = self.updater.dispatcher
-        from telegram.ext import Filters
-        handler = MessageHandler([Filters.text], self.telegramHandlerEditedTest, allow_edited=True)
-        d.addHandler(handler)
-        self.updater.start_polling(0.01)
-        sleep(.1)
-        self.assertEqual(self.received_message, 'Test')
-
-        # Remove handler
-        d.removeHandler(handler)
-        handler = MessageHandler(
-            [Filters.text], self.telegramHandlerEditedTest, allow_edited=False)
-        d.addHandler(handler)
-        self.reset()
-
-        self.updater.bot.send_messages = 1
-        sleep(.1)
-        self.assertTrue(None is self.received_message)
-
-    def test_addTelegramMessageHandlerMultipleMessages(self):
-        self._setup_updater('Multiple', 100)
-        self.updater.dispatcher.add_handler(MessageHandler([], self.telegramHandlerTest))
-        self.updater.start_polling(0.0)
-        sleep(2)
-        self.assertEqual(self.received_message, 'Multiple')
-        self.assertEqual(self.message_count, 100)
-
-    def test_addRemoveTelegramRegexHandler(self):
-        self._setup_updater('Test2')
-        d = self.updater.dispatcher
-        regobj = re.compile('Te.*')
-        handler = RegexHandler(regobj, self.telegramHandlerTest)
-        self.updater.dispatcher.add_handler(handler)
-        self.updater.start_polling(0.01)
-        sleep(.1)
-        self.assertEqual(self.received_message, 'Test2')
-
-        # Remove handler
-        d.remove_handler(handler)
-        self.reset()
-
-        self.updater.bot.send_messages = 1
-        sleep(.1)
-        self.assertTrue(None is self.received_message)
-
-    def test_addRemoveTelegramCommandHandler(self):
-        self._setup_updater('/test')
-        d = self.updater.dispatcher
-        handler = CommandHandler('test', self.telegramHandlerTest)
-        self.updater.dispatcher.add_handler(handler)
-        self.updater.start_polling(0.01)
-        sleep(.1)
-        self.assertEqual(self.received_message, '/test')
-
-        # Remove handler
-        d.remove_handler(handler)
-        self.reset()
-
-        self.updater.bot.send_messages = 1
-        sleep(.1)
-        self.assertTrue(None is self.received_message)
-
-    def test_editedCommandHandler(self):
-        self._setup_updater('/test', edited=True)
-        d = self.updater.dispatcher
-        handler = CommandHandler('test', self.telegramHandlerEditedTest, allow_edited=True)
-        d.addHandler(handler)
-        self.updater.start_polling(0.01)
-        sleep(.1)
-        self.assertEqual(self.received_message, '/test')
-
-        # Remove handler
-        d.removeHandler(handler)
-        handler = CommandHandler('test', self.telegramHandlerEditedTest, allow_edited=False)
-        d.addHandler(handler)
-        self.reset()
-
-        self.updater.bot.send_messages = 1
-        sleep(.1)
-        self.assertTrue(None is self.received_message)
-
-    def test_addRemoveStringRegexHandler(self):
-        self._setup_updater('', messages=0)
-        d = self.updater.dispatcher
-        handler = StringRegexHandler('Te.*', self.stringHandlerTest)
-        d.add_handler(handler)
-        queue = self.updater.start_polling(0.01)
-        queue.put('Test3')
-        sleep(.1)
-        self.assertEqual(self.received_message, 'Test3')
-
-        # Remove handler
-        d.remove_handler(handler)
-        self.reset()
-
-        queue.put('Test3')
-        sleep(.1)
-        self.assertTrue(None is self.received_message)
-
-    def test_addRemoveStringCommandHandler(self):
-        self._setup_updater('', messages=0)
-        d = self.updater.dispatcher
-        handler = StringCommandHandler('test3', self.stringHandlerTest)
-        d.add_handler(handler)
-
-        queue = self.updater.start_polling(0.01)
-        queue.put('/test3')
-        sleep(.1)
-        self.assertEqual(self.received_message, '/test3')
-
-        # Remove handler
-        d.remove_handler(handler)
-        self.reset()
-
-        queue.put('/test3')
-        sleep(.1)
-        self.assertTrue(None is self.received_message)
-
-    def test_addRemoveErrorHandler(self):
-        self._setup_updater('', messages=0)
-        d = self.updater.dispatcher
-        d.add_error_handler(self.errorHandlerTest)
-        queue = self.updater.start_polling(0.01)
-        error = TelegramError("Unauthorized.")
-        queue.put(error)
-        sleep(.1)
-        self.assertEqual(self.received_message, "Unauthorized.")
-
-        # Remove handler
-        d.remove_error_handler(self.errorHandlerTest)
-        self.reset()
-
-        queue.put(error)
-        sleep(.1)
-        self.assertTrue(None is self.received_message)
-
-    def test_errorInHandler(self):
-        self._setup_updater('', messages=0)
-        d = self.updater.dispatcher
-        handler = StringRegexHandler('.*', self.errorRaisingHandlerTest)
-        d.add_handler(handler)
-        self.updater.dispatcher.add_error_handler(self.errorHandlerTest)
-        queue = self.updater.start_polling(0.01)
-
-        queue.put('Test Error 1')
-        sleep(.1)
-        self.assertEqual(self.received_message, 'Test Error 1')
-
-    def test_cleanBeforeStart(self):
-        self._setup_updater('')
-        d = self.updater.dispatcher
-        handler = MessageHandler([], self.telegramHandlerTest)
-        d.add_handler(handler)
-        self.updater.start_polling(0.01, clean=True)
-        sleep(.1)
-        self.assertEqual(self.message_count, 0)
-        self.assertIsNone(self.received_message)
-
-    def test_errorOnGetUpdates(self):
-        self._setup_updater('', raise_error=True)
-        d = self.updater.dispatcher
-        d.add_error_handler(self.errorHandlerTest)
-        self.updater.start_polling(0.01)
-        sleep(.1)
-        self.assertEqual(self.received_message, "Test Error 2")
-
-    def test_addRemoveTypeHandler(self):
-        self._setup_updater('', messages=0)
-        d = self.updater.dispatcher
-        handler = TypeHandler(dict, self.stringHandlerTest)
-        d.add_handler(handler)
-        queue = self.updater.start_polling(0.01)
-        payload = {"Test": 42}
-        queue.put(payload)
-        sleep(.1)
-        self.assertEqual(self.received_message, payload)
-
-        # Remove handler
-        d.remove_handler(handler)
-        self.reset()
-
-        queue.put(payload)
-        sleep(.1)
-        self.assertTrue(None is self.received_message)
-
-    def test_addRemoveInlineQueryHandler(self):
-        self._setup_updater('', messages=0)
-        d = self.updater.dispatcher
-        handler = InlineQueryHandler(self.telegramInlineHandlerTest)
-        handler2 = ChosenInlineResultHandler(self.telegramInlineHandlerTest)
-        d.add_handler(handler)
-        d.add_handler(handler2)
-        queue = self.updater.start_polling(0.01)
-        update = Update(update_id=0, inline_query="testquery")
-        update2 = Update(update_id=0, chosen_inline_result="testresult")
-        queue.put(update)
-        sleep(.1)
-        self.assertEqual(self.received_message[0], "testquery")
-
-        queue.put(update2)
-        sleep(.1)
-        self.assertEqual(self.received_message[1], "testresult")
-
-        # Remove handler
-        d.remove_handler(handler)
-        d.remove_handler(handler2)
-        self.reset()
-
-        queue.put(update)
-        sleep(.1)
-        self.assertTrue(None is self.received_message)
-
-    def test_addRemoveCallbackQueryHandler(self):
-        self._setup_updater('', messages=0)
-        d = self.updater.dispatcher
-        handler = CallbackQueryHandler(self.telegramCallbackHandlerTest)
-        d.add_handler(handler)
-        queue = self.updater.start_polling(0.01)
-        update = Update(update_id=0, callback_query="testcallback")
-        queue.put(update)
-        sleep(.1)
-        self.assertEqual(self.received_message, "testcallback")
-
-        # Remove handler
-        d.remove_handler(handler)
-        self.reset()
-
-        queue.put(update)
-        sleep(.1)
-        self.assertTrue(None is self.received_message)
-
-    def test_runAsync(self):
-        self._setup_updater('Test5', messages=2)
-        d = self.updater.dispatcher
-        handler = MessageHandler([], self.asyncHandlerTest)
-        d.add_handler(handler)
-        self.updater.start_polling(0.01)
-        sleep(1.2)
-        self.assertEqual(self.received_message, 'Test5')
-        self.assertEqual(self.message_count, 2)
-
-    def test_multiple_dispatchers(self):
-
-        def get_dispatcher_name(q):
-            q.put(current_thread().name)
-            sleep(1.2)
-
-        d1 = Dispatcher(MockBot('disp1'), Queue())
-        d2 = Dispatcher(MockBot('disp2'), Queue())
-        q1 = Queue()
-        q2 = Queue()
-        d1._init_async_threads('test_1', workers=1)
-        d2._init_async_threads('test_2', workers=1)
-
-        try:
-            d1.run_async(get_dispatcher_name, q1)
-            d2.run_async(get_dispatcher_name, q2)
-
-            name1 = q1.get()
-            name2 = q2.get()
-
-            self.assertNotEqual(name1, name2)
-        finally:
-            d1.stop()
-            d2.stop()
-            # following three lines are for pypy unitests
-            d1._reset_singleton()
-            del d1
-            del d2
-
-    def test_multiple_dispatcers_no_decorator(self):
-
-        @run_async
-        def must_raise_runtime_error():
-            pass
-
-        d1 = Dispatcher(MockBot('disp1'), Queue(), workers=1)
-        d2 = Dispatcher(MockBot('disp2'), Queue(), workers=1)
-
-        self.assertRaises(RuntimeError, must_raise_runtime_error)
-
-        d1.stop()
-        d2.stop()
-        # following three lines are for pypy unitests
-        d1._reset_singleton()
-        del d1
-        del d2
-
-    def test_additionalArgs(self):
-        self._setup_updater('', messages=0)
-        handler = StringCommandHandler(
-            'test5',
-            self.additionalArgsTest,
-            pass_update_queue=True,
-            pass_job_queue=True,
-            pass_args=True)
-        self.updater.dispatcher.add_handler(handler)
-
-        queue = self.updater.start_polling(0.01)
-        queue.put('/test5 resend')
-        sleep(.1)
-        self.assertEqual(self.received_message, '/test5 noresend')
-        self.assertEqual(self.message_count, 2)
-
-    def test_regexGroupHandler(self):
-        self._setup_updater('', messages=0)
-        d = self.updater.dispatcher
-        handler = StringRegexHandler(
-            '^(This).*?(?P<testgroup>regex group).*',
-            self.regexGroupHandlerTest,
-            pass_groupdict=True,
-            pass_groups=True)
-        d.add_handler(handler)
-        queue = self.updater.start_polling(0.01)
-        queue.put('This is a test message for regex group matching.')
-        sleep(.1)
-        self.assertEqual(self.received_message, (('This', 'regex group'),
-                                                 {'testgroup': 'regex group'}))
-
-    def test_regexGroupHandlerInlineQuery(self):
-        self._setup_updater('', messages=0)
-        d = self.updater.dispatcher
-        handler = InlineQueryHandler(
-            self.regexGroupHandlerTest,
-            pattern='^(This).*?(?P<testgroup>regex group).*',
-            pass_groupdict=True,
-            pass_groups=True)
-        d.add_handler(handler)
-        queue = self.updater.start_polling(0.01)
-        queue.put(
-            Update(
-                update_id=0,
-                inline_query=InlineQuery(
-                    0, None, 'This is a test message for regex group matching.', None)))
-
-        sleep(.1)
-        self.assertEqual(self.received_message, (('This', 'regex group'),
-                                                 {'testgroup': 'regex group'}))
-
-    def test_regexGroupHandlerCallbackQuery(self):
-        self._setup_updater('', messages=0)
-        d = self.updater.dispatcher
-        handler = CallbackQueryHandler(
-            self.regexGroupHandlerTest,
-            pattern='^(This).*?(?P<testgroup>regex group).*',
-            pass_groupdict=True,
-            pass_groups=True)
-        d.add_handler(handler)
-        queue = self.updater.start_polling(0.01)
-        queue.put(
-            Update(
-                update_id=0,
-                callback_query=CallbackQuery(0, None,
-                                             'This is a test message for regex group matching.')))
-
-        sleep(.1)
-        self.assertEqual(self.received_message, (('This', 'regex group'),
-                                                 {'testgroup': 'regex group'}))
-
-    def test_runAsyncWithAdditionalArgs(self):
-        self._setup_updater('Test6', messages=2)
-        d = self.updater.dispatcher
-        handler = MessageHandler([], self.asyncAdditionalHandlerTest, pass_update_queue=True)
-        d.add_handler(handler)
-        self.updater.start_polling(0.01)
-        sleep(1.2)
-        self.assertEqual(self.received_message, 'Test6')
-        self.assertEqual(self.message_count, 2)
-
-    def test_webhook(self):
-        self._setup_updater('', messages=0)
-        d = self.updater.dispatcher
-        handler = MessageHandler([], self.telegramHandlerTest)
-        d.add_handler(handler)
+        # NOTE: This test might hit a race condition and fail (though the 1 seconds delay above
+        #       should work around it).
+        # NOTE: Checking Updater.running is problematic because it is not set to False when there's
+        #       an unhandled exception.
+        # TODO: We should have a way to poll Updater status and decide if it's running or not.
+        assert any('unhandled exception in updater' in rec.getMessage() for rec in
+                   caplog.get_records('call'))
+
+    @pytest.mark.parametrize(('error',),
+                             argvalues=[(RetryAfter(0.01),),
+                                        (TimedOut(),)],
+                             ids=('RetryAfter', 'TimedOut'))
+    def test_get_updates_retries(self, monkeypatch, updater, error):
+        event = Event()
+
+        def test(*args, **kwargs):
+            event.set()
+            raise error
+
+        monkeypatch.setattr('telegram.Bot.get_updates', test)
+        monkeypatch.setattr('telegram.Bot.set_webhook', lambda *args, **kwargs: True)
+        updater.dispatcher.add_error_handler(self.error_handler)
+        updater.start_polling(0.01)
+
+        # Make sure that get_updates was called, but not the error handler
+        event.wait()
+        assert self.err_handler_called.wait(0.5) is not True
+        assert self.received != error.message
+
+        # Make sure that Updater polling thread keeps running
+        event.clear()
+        event.wait()
+        assert self.err_handler_called.wait(0.5) is not True
+
+    def test_webhook(self, monkeypatch, updater):
+        q = Queue()
+        monkeypatch.setattr('telegram.Bot.set_webhook', lambda *args, **kwargs: True)
+        monkeypatch.setattr('telegram.Bot.delete_webhook', lambda *args, **kwargs: True)
+        monkeypatch.setattr('telegram.ext.Dispatcher.process_update', lambda _, u: q.put(u))
 
         ip = '127.0.0.1'
         port = randrange(1024, 49152)  # Select random port for travis
-        self.updater.start_webhook(
+        updater.start_webhook(
             ip,
             port,
-            url_path='TOKEN',
-            cert='./tests/test_updater.py',
-            key='./tests/test_updater.py',
-            webhook_url=None)
-        sleep(0.5)
-        # SSL-Wrapping will fail, so we start the server without SSL
-        Thread(target=self.updater.httpd.serve_forever).start()
+            url_path='TOKEN')
+        sleep(.2)
+        try:
+            # Now, we send an update to the server via urlopen
+            update = Update(1, message=Message(1, User(1, '', False), None, Chat(1, ''),
+                                               text='Webhook'))
+            self._send_webhook_msg(ip, port, update.to_json(), 'TOKEN')
+            sleep(.2)
+            assert q.get(False) == update
 
-        # Now, we send an update to the server via urlopen
-        message = Message(
-            1, User(1, "Tester"), datetime.now(), Chat(
-                1, "group", title="Test Group"))
+            # Returns 404 if path is incorrect
+            with pytest.raises(HTTPError) as excinfo:
+                self._send_webhook_msg(ip, port, None, 'webookhandler.py')
+            assert excinfo.value.code == 404
 
-        message.text = "Webhook Test"
-        update = Update(1)
-        update.message = message
+            with pytest.raises(HTTPError) as excinfo:
+                self._send_webhook_msg(ip, port, None, 'webookhandler.py',
+                                       get_method=lambda: 'HEAD')
+            assert excinfo.value.code == 404
 
-        self._send_webhook_msg(ip, port, update.to_json(), 'TOKEN')
+            # Test multiple shutdown() calls
+            updater.httpd.shutdown()
+        finally:
+            updater.httpd.shutdown()
+            sleep(.2)
+            assert not updater.httpd.is_running
+            updater.stop()
 
-        sleep(1)
-        self.assertEqual(self.received_message, 'Webhook Test')
+    def test_webhook_ssl(self, monkeypatch, updater):
+        monkeypatch.setattr('telegram.Bot.set_webhook', lambda *args, **kwargs: True)
+        monkeypatch.setattr('telegram.Bot.delete_webhook', lambda *args, **kwargs: True)
+        ip = '127.0.0.1'
+        port = randrange(1024, 49152)  # Select random port for travis
+        tg_err = False
+        try:
+            updater._start_webhook(
+                ip,
+                port,
+                url_path='TOKEN',
+                cert='./tests/test_updater.py',
+                key='./tests/test_updater.py',
+                bootstrap_retries=0,
+                clean=False,
+                webhook_url=None,
+                allowed_updates=None)
+        except TelegramError:
+            tg_err = True
+        assert tg_err
 
-        print("Test other webhook server functionalities...")
-        response = self._send_webhook_msg(ip, port, None, 'webookhandler.py')
-        self.assertEqual(b'', response.read())
-        self.assertEqual(200, response.code)
-
-        response = self._send_webhook_msg(
-            ip, port, None, 'webookhandler.py', get_method=lambda: 'HEAD')
-
-        self.assertEqual(b'', response.read())
-        self.assertEqual(200, response.code)
-
-        # Test multiple shutdown() calls
-        self.updater.httpd.shutdown()
-        self.updater.httpd.shutdown()
-        self.assertTrue(True)
-
-    def test_webhook_no_ssl(self):
-        self._setup_updater('', messages=0)
-        d = self.updater.dispatcher
-        handler = MessageHandler([], self.telegramHandlerTest)
-        d.add_handler(handler)
+    def test_webhook_no_ssl(self, monkeypatch, updater):
+        q = Queue()
+        monkeypatch.setattr('telegram.Bot.set_webhook', lambda *args, **kwargs: True)
+        monkeypatch.setattr('telegram.Bot.delete_webhook', lambda *args, **kwargs: True)
+        monkeypatch.setattr('telegram.ext.Dispatcher.process_update', lambda _, u: q.put(u))
 
         ip = '127.0.0.1'
         port = randrange(1024, 49152)  # Select random port for travis
-        self.updater.start_webhook(ip, port, webhook_url=None)
-        sleep(0.5)
+        updater.start_webhook(ip, port, webhook_url=None)
+        sleep(.2)
 
         # Now, we send an update to the server via urlopen
-        message = Message(
-            1, User(1, "Tester 2"), datetime.now(), Chat(
-                1, 'group', title="Test Group 2"))
-
-        message.text = "Webhook Test 2"
-        update = Update(1)
-        update.message = message
-
+        update = Update(1, message=Message(1, User(1, '', False), None, Chat(1, ''),
+                                           text='Webhook 2'))
         self._send_webhook_msg(ip, port, update.to_json())
-        sleep(1)
-        self.assertEqual(self.received_message, 'Webhook Test 2')
+        sleep(.2)
+        assert q.get(False) == update
+        updater.stop()
 
-    def test_start_dispatcher_twice(self):
-        self._setup_updater('', messages=0)
-        self.updater.start_polling(0.1)
-        sleep(0.5)
-        self.updater.dispatcher.start()
+    @pytest.mark.parametrize(('error',),
+                             argvalues=[(TelegramError(''),)],
+                             ids=('TelegramError',))
+    def test_bootstrap_retries_success(self, monkeypatch, updater, error):
+        retries = 2
 
-    def test_bootstrap_retries_success(self):
-        retries = 3
-        self._setup_updater('', messages=0, bootstrap_retries=retries)
+        def attempt(_, *args, **kwargs):
+            if self.attempts < retries:
+                self.attempts += 1
+                raise error
 
-        self.updater._bootstrap(retries, False, 'path', None)
-        self.assertEqual(self.updater.bot.bootstrap_attempts, retries)
+        monkeypatch.setattr('telegram.Bot.set_webhook', attempt)
 
-    def test_bootstrap_retries_unauth(self):
-        retries = 3
-        self._setup_updater(
-            '', messages=0, bootstrap_retries=retries, bootstrap_err=Unauthorized())
+        updater.running = True
+        updater._bootstrap(retries, False, 'path', None, bootstrap_interval=0)
+        assert self.attempts == retries
 
-        self.assertRaises(Unauthorized, self.updater._bootstrap, retries, False, 'path', None)
-        self.assertEqual(self.updater.bot.bootstrap_attempts, 1)
-
-    def test_bootstrap_retries_invalid_token(self):
-        retries = 3
-        self._setup_updater(
-            '', messages=0, bootstrap_retries=retries, bootstrap_err=InvalidToken())
-
-        self.assertRaises(InvalidToken, self.updater._bootstrap, retries, False, 'path', None)
-        self.assertEqual(self.updater.bot.bootstrap_attempts, 1)
-
-    def test_bootstrap_retries_fail(self):
+    @pytest.mark.parametrize(('error', 'attempts'),
+                             argvalues=[(TelegramError(''), 2),
+                                        (Unauthorized(''), 1),
+                                        (InvalidToken(), 1)],
+                             ids=('TelegramError', 'Unauthorized', 'InvalidToken'))
+    def test_bootstrap_retries_error(self, monkeypatch, updater, error, attempts):
         retries = 1
-        self._setup_updater('', messages=0, bootstrap_retries=retries)
 
-        self.assertRaisesRegexp(TelegramError, 'test', self.updater._bootstrap, retries - 1, False,
-                                'path', None)
-        self.assertEqual(self.updater.bot.bootstrap_attempts, 1)
+        def attempt(_, *args, **kwargs):
+            self.attempts += 1
+            raise error
 
-    def test_webhook_invalid_posts(self):
-        self._setup_updater('', messages=0)
+        monkeypatch.setattr('telegram.Bot.set_webhook', attempt)
 
+        updater.running = True
+        with pytest.raises(type(error)):
+            updater._bootstrap(retries, False, 'path', None, bootstrap_interval=0)
+        assert self.attempts == attempts
+
+    def test_webhook_invalid_posts(self, updater):
         ip = '127.0.0.1'
         port = randrange(1024, 49152)  # select random port for travis
         thr = Thread(
-            target=self.updater._start_webhook, args=(ip, port, '', None, None, 0, False, None))
+            target=updater._start_webhook,
+            args=(ip, port, '', None, None, 0, False, None, None))
         thr.start()
 
-        sleep(0.5)
+        sleep(.2)
 
         try:
-            with self.assertRaises(HTTPError) as ctx:
-                self._send_webhook_msg(
-                    ip, port, '<root><bla>data</bla></root>', content_type='application/xml')
-            self.assertEqual(ctx.exception.code, 403)
+            with pytest.raises(HTTPError) as excinfo:
+                self._send_webhook_msg(ip, port, '<root><bla>data</bla></root>',
+                                       content_type='application/xml')
+            assert excinfo.value.code == 403
 
-            with self.assertRaises(HTTPError) as ctx:
+            with pytest.raises(HTTPError) as excinfo:
                 self._send_webhook_msg(ip, port, 'dummy-payload', content_len=-2)
-            self.assertEqual(ctx.exception.code, 403)
+            assert excinfo.value.code == 500
 
             # TODO: prevent urllib or the underlying from adding content-length
-            # with self.assertRaises(HTTPError) as ctx:
-            #     self._send_webhook_msg(ip, port, 'dummy-payload',
-            #                            content_len=None)
-            # self.assertEqual(ctx.exception.code, 411)
+            # with pytest.raises(HTTPError) as excinfo:
+            #     self._send_webhook_msg(ip, port, 'dummy-payload', content_len=None)
+            # assert excinfo.value.code == 411
 
-            with self.assertRaises(HTTPError) as ctx:
+            with pytest.raises(HTTPError):
                 self._send_webhook_msg(ip, port, 'dummy-payload', content_len='not-a-number')
-            self.assertEqual(ctx.exception.code, 403)
+            assert excinfo.value.code == 500
 
         finally:
-            self.updater._stop_httpd()
+            updater.httpd.shutdown()
             thr.join()
 
     def _send_webhook_msg(self,
@@ -702,7 +296,7 @@ class UpdaterTest(BaseTest, unittest.TestCase):
                           content_len=-1,
                           content_type='application/json',
                           get_method=None):
-        headers = {'content-type': content_type,}
+        headers = {'content-type': content_type, }
 
         if not payload_str:
             content_len = None
@@ -725,85 +319,59 @@ class UpdaterTest(BaseTest, unittest.TestCase):
 
         return urlopen(req)
 
-    def signalsender(self):
-        sleep(0.5)
+    def signal_sender(self, updater):
+        sleep(0.2)
+        while not updater.running:
+            sleep(0.2)
+
         os.kill(os.getpid(), signal.SIGTERM)
 
-    def test_idle(self):
-        self._setup_updater('Test6', messages=0)
-        self.updater.start_polling(poll_interval=0.01)
-        Thread(target=self.signalsender).start()
-        self.updater.idle()
+    @signalskip
+    def test_idle(self, updater, caplog):
+        updater.start_polling(0.01)
+        Thread(target=partial(self.signal_sender, updater=updater)).start()
+
+        with caplog.at_level(logging.INFO):
+            updater.idle()
+
+        rec = caplog.records[-1]
+        assert rec.msg.startswith('Received signal {}'.format(signal.SIGTERM))
+        assert rec.levelname == 'INFO'
+
         # If we get this far, idle() ran through
-        sleep(1)
-        self.assertFalse(self.updater.running)
+        sleep(.5)
+        assert updater.running is False
 
-    def test_createBot(self):
-        self.updater = Updater('123:abcd')
-        self.assertIsNotNone(self.updater.bot)
+    @signalskip
+    def test_user_signal(self, updater):
+        temp_var = {'a': 0}
 
-    def test_mutualExclusiveTokenBot(self):
+        def user_signal_inc(signum, frame):
+            temp_var['a'] = 1
+
+        updater.user_sig_handler = user_signal_inc
+        updater.start_polling(0.01)
+        Thread(target=partial(self.signal_sender, updater=updater)).start()
+        updater.idle()
+        # If we get this far, idle() ran through
+        sleep(.5)
+        assert updater.running is False
+        assert temp_var['a'] != 0
+
+    def test_create_bot(self):
+        updater = Updater('123:abcd')
+        assert updater.bot is not None
+
+    def test_mutual_exclude_token_bot(self):
         bot = Bot('123:zyxw')
-        self.assertRaises(ValueError, Updater, token='123:abcd', bot=bot)
+        with pytest.raises(ValueError):
+            Updater(token='123:abcd', bot=bot)
 
-    def test_noTokenOrBot(self):
-        self.assertRaises(ValueError, Updater)
+    def test_no_token_or_bot(self):
+        with pytest.raises(ValueError):
+            Updater()
 
-
-class MockBot(object):
-
-    def __init__(self,
-                 text,
-                 messages=1,
-                 raise_error=False,
-                 bootstrap_retries=None,
-                 bootstrap_err=TelegramError('test'),
-                 edited=False):
-        self.text = text
-        self.send_messages = messages
-        self.raise_error = raise_error
-        self.token = "TOKEN"
-        self.bootstrap_retries = bootstrap_retries
-        self.bootstrap_attempts = 0
-        self.bootstrap_err = bootstrap_err
-        self.edited = edited
-
-    def mockUpdate(self, text):
-        message = Message(0, None, None, None)
-        message.text = text
-        update = Update(0)
-
-        if self.edited:
-            update.edited_message = message
-        else:
-            update.message = message
-
-        return update
-
-    def setWebhook(self, webhook_url=None, certificate=None):
-        if self.bootstrap_retries is None:
-            return
-
-        if self.bootstrap_attempts < self.bootstrap_retries:
-            self.bootstrap_attempts += 1
-            raise self.bootstrap_err
-
-    def getUpdates(self, offset=None, limit=100, timeout=0, network_delay=2.):
-
-        if self.raise_error:
-            raise TelegramError('Test Error 2')
-        elif self.send_messages >= 2:
-            self.send_messages -= 2
-            return self.mockUpdate(self.text), self.mockUpdate(self.text)
-        elif self.send_messages == 1:
-            self.send_messages -= 1
-            return self.mockUpdate(self.text),
-        else:
-            return []
-
-    def create_references(self, d):
-        pass
-
-
-if __name__ == '__main__':
-    unittest.main()
+    def test_mutual_exclude_bot_private_key(self):
+        bot = Bot('123:zyxw')
+        with pytest.raises(ValueError):
+            Updater(bot=bot, private_key=b'key')

@@ -17,6 +17,8 @@ def requirements():
     return requirements_list
 
 
+packages = find_packages(exclude=['tests*'])
+
 with codecs.open('README.rst', 'r', 'utf-8') as fd:
     fn = os.path.join('telegram', 'version.py')
     with open(fn) as fh:
@@ -30,12 +32,13 @@ with codecs.open('README.rst', 'r', 'utf-8') as fd:
           license='LGPLv3',
           url='https://python-telegram-bot.org/',
           keywords='python telegram bot api wrapper',
-          description='Not just a Python wrapper around the Telegram Bot API',
+          description="We have made you a wrapper you can't refuse",
           long_description=fd.read(),
-          packages=find_packages(exclude=['tests*']),
+          packages=packages,
           install_requires=requirements(),
           extras_require={
               'json': 'ujson',
+              'socks': 'PySocks'
           },
           include_package_data=True,
           classifiers=[
@@ -50,7 +53,8 @@ with codecs.open('README.rst', 'r', 'utf-8') as fd:
               'Programming Language :: Python :: 2',
               'Programming Language :: Python :: 2.7',
               'Programming Language :: Python :: 3',
-              'Programming Language :: Python :: 3.3',
               'Programming Language :: Python :: 3.4',
               'Programming Language :: Python :: 3.5',
+              'Programming Language :: Python :: 3.6',
+              'Programming Language :: Python :: 3.7'
           ],)
